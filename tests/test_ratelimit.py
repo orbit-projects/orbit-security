@@ -27,10 +27,13 @@ async def test_rate_limit_middleware_rejects_and_emits_headers() -> None:
     app = Application(ApplicationConfig(name="rate-limit"))
     asgi = ASGIApplication(app)
     asgi.add_middleware(RateLimitMiddleware(1, 60, key=lambda request: "test-client"))
+    invoked = 0
 
     @app.router.route("/", name="root")
     async def root(request: Request) -> Response:
-        return Response.text("ok")
+        nonlocal invoked
+        invoked += 1
+        return Response(status=200, body=b"ok", headers=[("x-app", "preserved")])
 
     async with TestClient(asgi) as client:
         first = await client.request("GET", "/")
@@ -38,9 +41,11 @@ async def test_rate_limit_middleware_rejects_and_emits_headers() -> None:
     assert first.status == 200
     assert first.headers["x-ratelimit-limit"] == "1"
     assert first.headers["x-ratelimit-remaining"] == "0"
+    assert first.headers["x-app"] == "preserved"
     assert second.status == 429
     assert second.headers["retry-after"] == "60"
     assert second.headers["x-ratelimit-remaining"] == "0"
+    assert invoked == 1
 
 
 def test_rate_limit_middleware_validates_key_callable() -> None:
@@ -64,3 +69,20 @@ async def test_rate_limit_middleware_preserves_falsey_callable_key() -> None:
 
     await middleware(Request("GET", "/"), next_handler)
     assert middleware.limiter.key_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("limit", "period", "expected"), [(2, 1, "1"), (1, 1.0001, "2")])
+async def test_retry_after_rounds_fractional_wait_up_to_a_whole_second(
+    limit: int, period: float, expected: str
+) -> None:
+    middleware = RateLimitMiddleware(limit, period, key=lambda request: "client")
+
+    async def next_handler(request: Request) -> Response:
+        return Response.text("ok")
+
+    for _ in range(limit):
+        await middleware(Request("GET", "/"), next_handler)
+    rejected = await middleware(Request("GET", "/"), next_handler)
+    assert rejected.status == 429
+    assert rejected.headers["retry-after"] == expected

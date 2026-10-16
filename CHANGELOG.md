@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `orbit-security` are recorded here. This project is pre-alpha; APIs may
+All notable changes to `orbit-security` are recorded here. This project is in alpha; APIs may
 change before a stable release.
 
 ## Unreleased

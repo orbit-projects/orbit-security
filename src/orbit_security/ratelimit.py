@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from math import isfinite
+from math import ceil, isfinite
 from threading import RLock
 from time import monotonic
 from unicodedata import category
@@ -43,7 +43,12 @@ class _Bucket:
 
 @dataclass(frozen=True)
 class RateLimitResult:
-    """Decision and retry delay returned by a limiter."""
+    """Immutable token-bucket decision.
+
+    ``remaining`` is the whole-token count immediately after the decision. ``retry_after`` is zero
+    for an allowed request and otherwise the fractional number of seconds until the requested cost
+    could be available at the configured refill rate.
+    """
 
     allowed: bool
     remaining: int
@@ -76,6 +81,10 @@ class RateLimiter:
     in-process implementation predictable under configuration mistakes and prevents extreme
     values from overflowing the floating-point token accounting path. At capacity, the least
     recently used identity is evicted in constant time before a new bucket is retained.
+
+    This instance coordinates threads within one process only. The lock makes each decision and
+    key eviction atomic for callers sharing this object; it does not synchronize worker processes
+    or hosts.
     """
 
     def __init__(self, limit: int, period: float, *, max_keys: int = 10_000) -> None:
@@ -113,7 +122,12 @@ class RateLimiter:
         return self._period
 
     def check(self, key: str, *, cost: int = 1, now: float | None = None) -> RateLimitResult:
-        """Consume tokens for a key and return an explicit retry delay when rejected."""
+        """Atomically consume ``cost`` tokens for ``key`` or return its retry delay.
+
+        ``now`` exists for deterministic tests and must use one monotonic time base across calls.
+        Normal applications should omit it. A rejected check does not consume tokens; elapsed time
+        refills the bucket up to its configured capacity.
+        """
         self._validate_key(key)
         if isinstance(cost, bool) or not isinstance(cost, int) or cost < 1 or cost > self.limit:
             raise ValueError("Rate-limit cost must be within the configured limit.")
@@ -185,7 +199,10 @@ class RateLimitMiddleware:
     The default key is the validated client host. Deployments behind a proxy should configure
     trusted forwarded headers in Core before using it; a custom key function may select an
     authenticated identity or another bounded tenant key. Each process owns an independent
-    bucket, so this middleware does not enforce shared quotas across workers or hosts.
+    bucket, so this middleware does not enforce shared quotas across workers or hosts. It charges
+    each request before route dispatch, adds ``X-RateLimit-Limit`` and
+    ``X-RateLimit-Remaining`` to all responses, and returns HTTP 429 with ``Retry-After`` when
+    the bucket is empty. The retry header rounds the delay up to whole seconds.
     """
 
     def __init__(
@@ -221,7 +238,7 @@ class RateLimitMiddleware:
             return self._with_headers(
                 response,
                 remaining=decision.remaining,
-                retry_after=max(1, int(decision.retry_after + 0.999)),
+                retry_after=max(1, ceil(decision.retry_after)),
             )
         response = await next_handler(request)
         return self._with_headers(response, remaining=decision.remaining)
